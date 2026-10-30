@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "addon_repo_filter"
+version = "0.1.0"
+name = "Add-on Repository Filter (DEV)"
+tagline = "Filter installed add-ons in preferences by extension repository"
+maintainer = "MD <m-dr>"
+type = "add-on"
+blender_version_min = "5.2.0"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+tags = [
+  "System",
+  "Interface",
+]
+website = "https://github.com/m-dr/blender-addon-repo-filter"
