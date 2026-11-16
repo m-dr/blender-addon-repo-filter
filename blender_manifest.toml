@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "addon_repo_filter"
-version = "0.1.1"
+version = "0.1.2"
 name = "Add-on Repository Filter (DEV)"
 tagline = "Filter installed add-ons in preferences by extension repository"
 maintainer = "MD <m-dr>"

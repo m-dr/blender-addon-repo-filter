@@ -1,12 +1,14 @@
 bl_info = {
     "name": "Add-on Repository Filter (DEV)",
     "author": "MD <m-dr>",
-    "version": (0, 1, 1),
+    "version": (0, 1, 2),
     "blender": (5, 2, 0),
     "location": "Preferences > Add-ons",
     "description": "Filter installed add-ons in preferences by extension repository",
     "category": "System",
 }
+
+import traceback
 
 import bpy
 import addon_utils
@@ -16,55 +18,77 @@ from bpy.props import EnumProperty
 _orig_addons_panel_draw = None
 _orig_addons_panel_draw_items = None
 
+# UI hook maintenance state.
+_REGISTERED = False
+_HEAL_INTERVAL = 1.0
+_OUR_MODULE = __name__
+
+
+def _log(message):
+    print("[addon_repo_filter] " + message)
+
+
+def _fn_name(func):
+    return getattr(func, "__name__", "")
+
+
+def _is_our_func(func, name):
+    return _fn_name(func) == name and getattr(func, "__module__", "") == _OUR_MODULE
+
 
 def get_addon_repo_items(self, context):
     """Dynamically populate repository filter items with counts of installed add-ons."""
+    fallback = [
+        ('_ALL_', "All Repositories", "Show all add-ons and extensions", 'RESTRICT_VIEW_OFF', 0),
+        ('_EXTENSIONS_', "All Extensions", "Show all extensions", 'PACKAGE', 1),
+        ('_LEGACY_', "Legacy Add-ons", "Show legacy add-ons", 'SCRIPTPLUGINS', 2),
+    ]
     if context is None or not hasattr(context, "preferences"):
-        return [
-            ('_ALL_', "All Repositories", "Show all add-ons and extensions", 'RESTRICT_VIEW_OFF', 0),
-            ('_EXTENSIONS_', "All Extensions", "Show all extensions", 'PACKAGE', 1),
-            ('_LEGACY_', "Legacy Add-ons", "Show legacy add-ons", 'SCRIPTPLUGINS', 2),
+        return fallback
+
+    try:
+        mods = addon_utils.modules(refresh=False)
+        repo_counts = {}
+        legacy_count = 0
+        ext_total = 0
+
+        for mod in mods:
+            m_name = getattr(mod, "__name__", "")
+            if addon_utils.check_extension(m_name):
+                ext_total += 1
+                parts = m_name.split(".")
+                if len(parts) >= 2:
+                    r_id = parts[1]
+                    repo_counts[r_id] = repo_counts.get(r_id, 0) + 1
+            else:
+                legacy_count += 1
+
+        items = [
+            ('_ALL_', f"All Repositories ({len(mods)})", "Show all add-ons and extensions", 'RESTRICT_VIEW_OFF', 0),
+            ('_EXTENSIONS_', f"All Extensions ({ext_total})", "Show all extensions from all repositories", 'PACKAGE', 1),
+            ('_LEGACY_', f"Legacy Add-ons ({legacy_count})", "Show legacy add-ons not installed as extensions", 'SCRIPTPLUGINS', 2),
         ]
 
-    mods = addon_utils.modules(refresh=False)
-    repo_counts = {}
-    legacy_count = 0
-    ext_total = 0
-
-    for mod in mods:
-        m_name = getattr(mod, "__name__", "")
-        if addon_utils.check_extension(m_name):
-            ext_total += 1
-            parts = m_name.split(".")
-            if len(parts) >= 2:
-                r_id = parts[1]
-                repo_counts[r_id] = repo_counts.get(r_id, 0) + 1
-        else:
-            legacy_count += 1
-
-    items = [
-        ('_ALL_', f"All Repositories ({len(mods)})", "Show all add-ons and extensions", 'RESTRICT_VIEW_OFF', 0),
-        ('_EXTENSIONS_', f"All Extensions ({ext_total})", "Show all extensions from all repositories", 'PACKAGE', 1),
-        ('_LEGACY_', f"Legacy Add-ons ({legacy_count})", "Show legacy add-ons not installed as extensions", 'SCRIPTPLUGINS', 2),
-    ]
-
-    repos = getattr(context.preferences.extensions, "repos", []) if hasattr(context.preferences, "extensions") else []
-    for idx, repo in enumerate(repos, start=3):
-        if not repo.enabled:
-            continue
-        cnt = repo_counts.get(repo.module, 0)
-        items.append((
-            repo.module,
-            f"{repo.name} ({cnt})",
-            f"Only show extensions installed from repository '{repo.name}' ({repo.module})",
-            'URL' if repo.use_remote_url else 'FILE_FOLDER',
-            idx
-        ))
-
-    return items
+        repos = getattr(context.preferences.extensions, "repos", []) if hasattr(context.preferences, "extensions") else []
+        for idx, repo in enumerate(repos, start=3):
+            if not repo.enabled:
+                continue
+            cnt = repo_counts.get(repo.module, 0)
+            items.append((
+                repo.module,
+                f"{repo.name} ({cnt})",
+                f"Only show extensions installed from repository '{repo.name}' ({repo.module})",
+                'URL' if repo.use_remote_url else 'FILE_FOLDER',
+                idx
+            ))
+        return items
+    except Exception:
+        # A dynamic enum callback must never raise: Blender calls it while drawing.
+        traceback.print_exc()
+        return fallback
 
 
-def filtered_addons_panel_draw_items(
+def _filtered_addons_panel_draw_items_impl(
     layout,
     context,
     *,
@@ -82,8 +106,6 @@ def filtered_addons_panel_draw_items(
     Wrap addons_panel_draw_items to filter add-ons by extension repository while
     returning all discovered module names so Blender's missing_modules check is satisfied.
     """
-    global _orig_addons_panel_draw_items
-
     all_modules = list(addon_modules)
     all_module_names = {getattr(m, "__name__", "") for m in all_modules}
 
@@ -129,7 +151,21 @@ def filtered_addons_panel_draw_items(
     return all_module_names
 
 
-def filtered_addons_panel_draw(panel, context):
+def filtered_addons_panel_draw_items(layout, context, *args, **kwargs):
+    """Fault-tolerant wrapper: never let filtering break Blender's add-on list."""
+    try:
+        return _filtered_addons_panel_draw_items_impl(layout, context, *args, **kwargs)
+    except Exception:
+        traceback.print_exc()
+        if _orig_addons_panel_draw_items is not None:
+            try:
+                return _orig_addons_panel_draw_items(layout, context, *args, **kwargs)
+            except Exception:
+                traceback.print_exc()
+        return set()
+
+
+def _filtered_addons_panel_draw_impl(panel, context):
     """Replacement for bl_pkg.bl_extension_ui.addons_panel_draw with repository filter UI."""
     import bl_pkg.bl_extension_ui as ext_ui
 
@@ -169,83 +205,202 @@ def filtered_addons_panel_draw(panel, context):
     )
 
 
+def filtered_addons_panel_draw(panel, context):
+    """Hook for USERPREF_PT_addons: a failure must never hide the whole page."""
+    try:
+        _filtered_addons_panel_draw_impl(panel, context)
+    except Exception:
+        traceback.print_exc()
+        if _orig_addons_panel_draw is not None:
+            try:
+                _orig_addons_panel_draw(panel, context)
+            except Exception:
+                traceback.print_exc()
+
+
 def addons_tags_draw(self, context):
     """Add repository selector to the top of the Add-on Tags popover."""
-    layout = self.layout
-    layout.label(text="Filter by Repository:")
-    layout.prop(context.window_manager, "addon_repo_filter", text="")
-    layout.separator()
+    try:
+        layout = self.layout
+        layout.label(text="Filter by Repository:")
+        layout.prop(context.window_manager, "addon_repo_filter", text="")
+        layout.separator()
+    except Exception:
+        traceback.print_exc()
 
 
-classes = ()
+def _ensure_properties():
+    if not hasattr(bpy.types.WindowManager, "addon_repo_filter"):
+        bpy.types.WindowManager.addon_repo_filter = EnumProperty(
+            name="Repository",
+            description="Filter add-ons by extension repository or legacy status",
+            items=get_addon_repo_items,
+            default=0,
+        )
+
+
+def _capture_originals():
+    global _orig_addons_panel_draw, _orig_addons_panel_draw_items
+    try:
+        import bl_pkg.bl_extension_ui as ext_ui
+    except Exception:
+        traceback.print_exc()
+        return
+
+    current_items = getattr(ext_ui, "addons_panel_draw_items", None)
+    if current_items is not None and not _is_our_func(current_items, "filtered_addons_panel_draw_items"):
+        _orig_addons_panel_draw_items = current_items
+
+    if _orig_addons_panel_draw is None:
+        _orig_addons_panel_draw = getattr(ext_ui, "addons_panel_draw", None)
+
+
+def _install_hooks():
+    """Install the UI hooks idempotently and in a stable order.
+
+    Blender owns the panel draw-function list and can rebuild (dropping our
+    function) or re-run registration (duplicating it) during a long session.
+    Always reduce the list to exactly: [Blender's panel header draw, our draw].
+    """
+    _capture_originals()
+
+    from bl_ui.space_userpref import USERPREF_PT_addons
+    import bl_pkg.bl_extension_ui as ext_ui
+
+    try:
+        draw_funcs = USERPREF_PT_addons._dyn_ui_initialize()
+    except Exception:
+        traceback.print_exc()
+        draw_funcs = getattr(getattr(USERPREF_PT_addons, "draw", None), "_draw_funcs", None)
+
+    if draw_funcs is not None:
+        for func in list(draw_funcs):
+            name = _fn_name(func)
+            module = getattr(func, "__module__", "")
+            if module == _OUR_MODULE and name in {"filtered_addons_panel_draw", "filtered_addons_panel_draw_items"}:
+                draw_funcs.remove(func)
+            elif module == "bl_pkg.bl_extension_ui" and name in {"addons_panel_draw", "addons_panel_draw_impl"}:
+                draw_funcs.remove(func)
+        draw_funcs.append(filtered_addons_panel_draw)
+
+    if getattr(ext_ui, "addons_panel_draw_items", None) is not filtered_addons_panel_draw_items:
+        ext_ui.addons_panel_draw_items = filtered_addons_panel_draw_items
+
+    tags_panel = getattr(ext_ui, "USERPREF_PT_addons_tags", None)
+    if tags_panel is not None:
+        try:
+            tags_panel._dyn_ui_initialize()
+            tag_funcs = getattr(getattr(tags_panel, "draw", None), "_draw_funcs", None)
+            if tag_funcs is not None:
+                for func in list(tag_funcs):
+                    if _is_our_func(func, "addons_tags_draw"):
+                        tag_funcs.remove(func)
+        except Exception:
+            traceback.print_exc()
+        try:
+            tags_panel.prepend(addons_tags_draw)
+        except Exception:
+            traceback.print_exc()
+
+    _ensure_properties()
+
+
+def _hooks_need_repair():
+    try:
+        from bl_ui.space_userpref import USERPREF_PT_addons
+        import bl_pkg.bl_extension_ui as ext_ui
+
+        draw_funcs = getattr(getattr(USERPREF_PT_addons, "draw", None), "_draw_funcs", None)
+        if not draw_funcs:
+            return True
+
+        ours = [f for f in draw_funcs if _is_our_func(f, "filtered_addons_panel_draw")]
+        if len(ours) != 1:
+            return True
+
+        for func in draw_funcs:
+            if (getattr(func, "__module__", "") == "bl_pkg.bl_extension_ui"
+                    and _fn_name(func) == "addons_panel_draw"):
+                # Blender's own panel draw is back: our replacement must not stack on it.
+                return True
+
+        if getattr(ext_ui, "addons_panel_draw_items", None) is not filtered_addons_panel_draw_items:
+            return True
+
+        if not hasattr(bpy.types.WindowManager, "addon_repo_filter"):
+            return True
+
+        return False
+    except Exception:
+        traceback.print_exc()
+        return True
+
+
+def _heal_timer():
+    if not _REGISTERED:
+        return None
+    try:
+        if _hooks_need_repair():
+            _log("repairing Blender UI hooks")
+            _install_hooks()
+    except Exception:
+        traceback.print_exc()
+    return _HEAL_INTERVAL
 
 
 def register():
-    global _orig_addons_panel_draw, _orig_addons_panel_draw_items
-
-    for cls in classes:
-        bpy.utils.register_class(cls)
-
-    bpy.types.WindowManager.addon_repo_filter = EnumProperty(
-        name="Repository",
-        description="Filter add-ons by extension repository or legacy status",
-        items=get_addon_repo_items,
-        default=0,
-    )
+    global _REGISTERED
 
     try:
-        import bl_pkg.bl_extension_ui as ext_ui
-        from bl_ui.space_userpref import USERPREF_PT_addons
+        _install_hooks()
+    except Exception:
+        traceback.print_exc()
 
-        _orig_addons_panel_draw = ext_ui.addons_panel_draw
-        _orig_addons_panel_draw_items = ext_ui.addons_panel_draw_items
-
-        # Monkey-patch addons_panel_draw_items to support repo filtering
-        ext_ui.addons_panel_draw_items = filtered_addons_panel_draw_items
-
-        # Replace addons_panel_draw in USERPREF_PT_addons
-        if hasattr(USERPREF_PT_addons, "remove") and _orig_addons_panel_draw in getattr(USERPREF_PT_addons.draw, "_draw_funcs", []):
-            USERPREF_PT_addons.remove(_orig_addons_panel_draw)
-        USERPREF_PT_addons.append(filtered_addons_panel_draw)
-
-        # Prepend repository selector to tags popover
-        if hasattr(ext_ui, "USERPREF_PT_addons_tags"):
-            ext_ui.USERPREF_PT_addons_tags.prepend(addons_tags_draw)
-
-    except Exception as e:
-        print(f"[addon_repo_filter] Failed to attach UI hooks: {e}")
+    _REGISTERED = True
+    if not bpy.app.timers.is_registered(_heal_timer):
+        bpy.app.timers.register(_heal_timer, first_interval=_HEAL_INTERVAL, persistent=True)
 
 
 def unregister():
-    global _orig_addons_panel_draw, _orig_addons_panel_draw_items
+    global _REGISTERED
+
+    _REGISTERED = False
+    if bpy.app.timers.is_registered(_heal_timer):
+        try:
+            bpy.app.timers.unregister(_heal_timer)
+        except Exception:
+            pass
 
     try:
-        import bl_pkg.bl_extension_ui as ext_ui
         from bl_ui.space_userpref import USERPREF_PT_addons
+        import bl_pkg.bl_extension_ui as ext_ui
 
-        # Remove custom draw function and restore original
-        if hasattr(USERPREF_PT_addons, "remove"):
-            if filtered_addons_panel_draw in getattr(USERPREF_PT_addons.draw, "_draw_funcs", []):
-                USERPREF_PT_addons.remove(filtered_addons_panel_draw)
-            if _orig_addons_panel_draw is not None and _orig_addons_panel_draw not in getattr(USERPREF_PT_addons.draw, "_draw_funcs", []):
-                USERPREF_PT_addons.append(_orig_addons_panel_draw)
+        draw_funcs = getattr(getattr(USERPREF_PT_addons, "draw", None), "_draw_funcs", None)
+        if draw_funcs is not None:
+            for func in list(draw_funcs):
+                if _is_our_func(func, "filtered_addons_panel_draw"):
+                    draw_funcs.remove(func)
+            if _orig_addons_panel_draw is not None and _orig_addons_panel_draw not in draw_funcs:
+                draw_funcs.append(_orig_addons_panel_draw)
 
-        # Restore original addons_panel_draw_items
         if _orig_addons_panel_draw_items is not None:
             ext_ui.addons_panel_draw_items = _orig_addons_panel_draw_items
 
-        # Remove from tags popover
-        if hasattr(ext_ui, "USERPREF_PT_addons_tags"):
-            ext_ui.USERPREF_PT_addons_tags.remove(addons_tags_draw)
-
-    except Exception as e:
-        print(f"[addon_repo_filter] Failed to restore original hooks: {e}")
+        tags_panel = getattr(ext_ui, "USERPREF_PT_addons_tags", None)
+        if tags_panel is not None:
+            tag_funcs = getattr(getattr(tags_panel, "draw", None), "_draw_funcs", None)
+            if tag_funcs is not None:
+                for func in list(tag_funcs):
+                    if _is_our_func(func, "addons_tags_draw"):
+                        tag_funcs.remove(func)
+    except Exception:
+        traceback.print_exc()
 
     if hasattr(bpy.types.WindowManager, "addon_repo_filter"):
-        del bpy.types.WindowManager.addon_repo_filter
-
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            del bpy.types.WindowManager.addon_repo_filter
+        except Exception:
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
