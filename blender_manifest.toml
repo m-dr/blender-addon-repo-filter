@@ -12,6 +12,6 @@ license = [
 ]
 tags = [
   "System",
-  "Interface",
+  "User Interface",
 ]
 website = "https://github.com/m-dr/blender-addon-repo-filter"
